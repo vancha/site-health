@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=Site Health
+Comment=An applet for monitoring website health
+Type=Application
+Icon=com.github.vancha.site_health
+Exec=site_health %F
+Terminal=false
+StartupNotify=true
+Categories=COSMIC
+Keywords=COSMIC
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicHoverPopup=Auto
+MimeType=
