@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0
 
-use cosmic::cosmic_config::{self, cosmic_config_derive::CosmicConfigEntry, CosmicConfigEntry};
+use cosmic::cosmic_config::{self, CosmicConfigEntry, cosmic_config_derive::CosmicConfigEntry};
 
 /// The sites monitored before the user has added or removed any of their own.
 pub const DEFAULT_SITES: &[&str] = &["captainslounge.nl", "draityachts.nl", "dedrait.com"];
