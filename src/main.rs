@@ -3,6 +3,9 @@
 mod app;
 mod config;
 mod i18n;
+mod pulse_icon;
+mod reaction;
+mod wander;
 
 fn main() -> cosmic::iced::Result {
     // Get the system's preferred languages.

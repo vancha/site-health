@@ -2,8 +2,10 @@
 
 use crate::config::Config;
 use crate::fl;
+use crate::pulse_icon::PulseIcon;
 use cosmic::cosmic_config::{self, ConfigSet, CosmicConfigEntry};
 use cosmic::iced::platform_specific::shell::wayland::commands::popup::destroy_popup;
+use cosmic::iced::time::Instant;
 use cosmic::iced::{Alignment, Subscription, futures, window::Id};
 use cosmic::prelude::*;
 use cosmic::widget;
@@ -281,7 +283,6 @@ struct Site {
 
 /// The application model stores app-specific state used to describe its interface and
 /// drive its logic.
-#[derive(Default)]
 pub struct AppModel {
     /// Application state which is managed by the COSMIC runtime.
     core: cosmic::Core,
@@ -300,6 +301,16 @@ pub struct AppModel {
     /// responsible for the actual HTTP checks and desktop notifications. Set once
     /// the health-check subscription reports in via `Message::LeaderElected`.
     is_leader: bool,
+    /// `domain_list()`, cached as an `Arc` and kept in sync whenever `sites`
+    /// changes. `subscription()` clones this into the health-check
+    /// subscription's key on every `Message::Frame` (20-30 times a second,
+    /// forever) — an `Arc` clone there is a refcount bump, where cloning a
+    /// fresh `Vec<String>` every time would be a real (if small) allocation
+    /// repeated 24/7 for data that essentially never changes.
+    watched_sites: Arc<Vec<String>>,
+    /// The panel icon: a circle pulsing green (all sites up) or red (at
+    /// least one down). See `pulse_icon` for the animation itself.
+    pulse_icon: PulseIcon,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -314,12 +325,21 @@ pub enum Message {
     RemoveSite(String),
     SetIntervalMinutes(u64),
     LeaderElected,
+    /// A new frame is about to be drawn, at this moment — drives the panel
+    /// icon's pulse animation.
+    Frame(Instant),
 }
 
 impl AppModel {
     /// The currently-watched domains, in order.
     fn domain_list(&self) -> Vec<String> {
         self.sites.iter().map(|site| site.domain.clone()).collect()
+    }
+
+    /// Whether any monitored site is currently known to be down — the panel
+    /// icon's alarm state tracks this directly.
+    fn any_down(&self) -> bool {
+        self.sites.iter().any(|site| site.up == Some(false))
     }
 
     /// Updates the in-memory site list and returns a task that persists it to
@@ -393,20 +413,27 @@ impl cosmic::Application for AppModel {
             })
             .unwrap_or_default();
 
+        let sites: Vec<Site> = config
+            .sites
+            .iter()
+            .map(|s| Site {
+                domain: normalize_domain(s),
+                up: None,
+            })
+            .collect();
+        let watched_sites = Arc::new(sites.iter().map(|site| site.domain.clone()).collect());
+
         // Construct the app model with the runtime's core.
         let app = AppModel {
             core,
-            sites: config
-                .sites
-                .iter()
-                .map(|s| Site {
-                    domain: normalize_domain(s),
-                    up: None,
-                })
-                .collect(),
+            popup: None,
+            sites,
+            watched_sites,
             config,
             config_handler,
-            ..Default::default()
+            new_site_input: String::new(),
+            is_leader: false,
+            pulse_icon: PulseIcon::new(Instant::now()),
         };
 
         (app, Task::none())
@@ -422,24 +449,14 @@ impl cosmic::Application for AppModel {
     /// This view should emit messages to toggle the applet's popup window, which will
     /// be drawn using the `view_window` method.
     fn view(&self) -> Element<'_, Self::Message> {
-        let any_down = self.sites.iter().any(|site| site.up == Some(false));
+        let (width, height) = self.core.applet.suggested_size(true);
+        let icon = self.pulse_icon.image(f32::from(width), f32::from(height));
 
-        let button = if any_down {
-            let color = cosmic::iced::Color::from_rgb8(0xE0, 0x1B, 0x24);
-            let icon = widget::icon::from_name("dialog-error-symbolic")
-                .symbolic(true)
-                .size(self.core.applet.suggested_size(true).0)
-                .icon()
-                .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(
-                    move |_theme: &cosmic::Theme| widget::svg::Style { color: Some(color) },
-                )));
-            self.core.applet.button_from_element(icon, true)
-        } else {
-            // Default symbolic styling, same as every other panel icon.
-            self.core.applet.icon_button("emblem-ok-symbolic")
-        };
-
-        button.on_press(Message::TogglePopup).into()
+        self.core
+            .applet
+            .button_from_element(icon, true)
+            .on_press(Message::TogglePopup)
+            .into()
     }
 
     /// The applet's popup window will be drawn using this view method. If there are
@@ -538,7 +555,7 @@ impl cosmic::Application for AppModel {
     /// activated by selectively appending to the subscription batch, and will
     /// continue to execute for the duration that they remain in the batch.
     fn subscription(&self) -> Subscription<Self::Message> {
-        let watched_sites = self.domain_list();
+        let watched_sites = Arc::clone(&self.watched_sites);
         let interval_secs = self.config.check_interval_secs;
         Subscription::batch(vec![
             // Re-checks every site on `interval_secs`, restarting fresh whenever the
@@ -546,12 +563,11 @@ impl cosmic::Application for AppModel {
             // makes real requests and notifies; everyone else relays from it.
             Subscription::run_with(
                 (watched_sites, interval_secs),
-                |(sites, interval_secs): &(Vec<String>, u64)| {
-                    let sites = sites.clone();
+                |(sites, interval_secs): &(Arc<Vec<String>>, u64)| {
+                    let sites = Arc::clone(sites);
                     let interval_secs = *interval_secs;
                     cosmic::iced::stream::channel(16, move |channel: MessageSender| async move {
                         let client = &*HTTP_CLIENT;
-                        let sites = Arc::new(sites);
                         let statuses: SharedStatuses =
                             Arc::new(Mutex::new(vec![None; sites.len()]));
                         let (updates_tx, _) = broadcast::channel::<StatusUpdate>(64);
@@ -608,6 +624,12 @@ impl cosmic::Application for AppModel {
 
                     Message::UpdateConfig(update.config)
                 }),
+            // Drives the panel icon's living pattern — it's always alive, so
+            // this is unconditional, unlike the health-check subscription above.
+            // A timer at the icon's own pace, rather than `window::frames()`
+            // (which would fire at the display's full refresh rate), since the
+            // icon doesn't need to be redrawn nearly that often.
+            cosmic::iced::time::every(self.pulse_icon.frame_interval()).map(Message::Frame),
         ])
     }
 
@@ -637,6 +659,8 @@ impl cosmic::Application for AppModel {
                     })
                     .collect();
                 self.config = config;
+                self.watched_sites = Arc::new(self.domain_list());
+                self.pulse_icon.set_alarm(self.any_down());
             }
             Message::CheckResult(domain, up) => {
                 let Some(entry) = self.sites.iter_mut().find(|site| site.domain == domain) else {
@@ -644,6 +668,7 @@ impl cosmic::Application for AppModel {
                 };
                 let prev = entry.up;
                 entry.up = Some(up);
+                self.pulse_icon.set_alarm(self.any_down());
 
                 // Notify on a real state change, and also on the very first check if the
                 // site is already down (don't notify on a first check that's already up).
@@ -683,12 +708,15 @@ impl cosmic::Application for AppModel {
                     let domain = domain.to_string();
                     if !self.sites.iter().any(|site| site.domain == domain) {
                         self.sites.push(Site { domain, up: None });
+                        self.watched_sites = Arc::new(self.domain_list());
                         return self.persist_sites();
                     }
                 }
             }
             Message::RemoveSite(domain) => {
                 self.sites.retain(|site| site.domain != domain);
+                self.watched_sites = Arc::new(self.domain_list());
+                self.pulse_icon.set_alarm(self.any_down());
                 return self.persist_sites();
             }
             Message::SetIntervalMinutes(minutes) => {
@@ -697,7 +725,11 @@ impl cosmic::Application for AppModel {
             Message::LeaderElected => {
                 self.is_leader = true;
             }
+            Message::Frame(at) => {
+                self.pulse_icon.advance(at);
+            }
             Message::TogglePopup => {
+                self.pulse_icon.next_species();
                 return if let Some(p) = self.popup.take() {
                     destroy_popup(p)
                 } else {
@@ -724,6 +756,18 @@ impl cosmic::Application for AppModel {
                 }
             }
         }
+        Task::none()
+    }
+
+    /// Called by libcosmic whenever the system theme changes: the user picked
+    /// another accent color, edited the theme, or switched between light and
+    /// dark. libcosmic watches the theme's config files for this.
+    fn system_theme_update(
+        &mut self,
+        _keys: &[&'static str],
+        new_theme: &cosmic::cosmic_theme::Theme,
+    ) -> Task<cosmic::Action<Self::Message>> {
+        self.pulse_icon.update_theme(new_theme);
         Task::none()
     }
 
